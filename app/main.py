@@ -8,11 +8,12 @@ import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from .storage import BLOCK_SIZE, CLONE_NAMES, BlockService, StorageError
+from . import gpt
+from .storage import BLOCK_SIZE, CLONE_NAMES, BlockService, StorageError, TableChangedError
 
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 BLOCK_COUNT = int(os.environ.get("BLOCK_COUNT", "32"))
@@ -40,6 +41,12 @@ app = FastAPI(title="Local Block Storage Drill", version="1.0.0", lifespan=lifes
 @app.exception_handler(StorageError)
 async def storage_error_handler(request: Request, exc: StorageError) -> JSONResponse:
     return JSONResponse(status_code=400, content={"error": str(exc)})
+
+
+@app.exception_handler(TableChangedError)
+async def table_changed_handler(request: Request, exc: TableChangedError) -> JSONResponse:
+    # 409：页面所见的分区表已过期，前端应提示并重新执行 GPT 检查
+    return JSONResponse(status_code=409, content={"error": str(exc), "recheck": True})
 
 
 def svc() -> BlockService:
@@ -139,6 +146,42 @@ async def read_template_block(block_no: int) -> Response:
             content={"error": "template index removed (retired) or block_no out of range"},
         )
     return JSONResponse(_read_payload(read))
+
+
+# --------------------------------------------------------------------- GPT
+@app.get("/api/clones/{name}/gpt")
+async def check_clone_gpt(name: str) -> dict:
+    """检查克隆盘的 GPT（512 字节扇区，主备表各自校验 CRC 与位置）。"""
+    return svc().gpt_check(name)
+
+
+@app.get("/api/clones/{name}/gpt/partitions/{partition_no}/sectors/{sector}")
+async def read_clone_gpt_sector(
+    name: str,
+    partition_no: int,
+    sector: int,
+    digest: str = Query(default="", description="页面检查时拿到的 table_digest"),
+) -> dict:
+    """读取分区内（从 0 起算）的一个 512 字节扇区；表指纹不符时返回 409。"""
+    return svc().gpt_read_partition_sector(name, partition_no, sector, digest)
+
+
+@app.get("/api/sample-gpt")
+async def sample_gpt_disk() -> dict:
+    """GPT 样盘：逐块 hex，可经原块写接口（PUT blocks）装入任一克隆盘。"""
+    s = svc()
+    blocks = gpt.build_sample_gpt_blocks(s.block_count)
+    return {
+        "block_count": s.block_count,
+        "block_size": BLOCK_SIZE,
+        "sector_size": gpt.SECTOR_SIZE,
+        "description": (
+            "GPT 样盘：保护性 MBR + 主/备 GPT，3 个分区"
+            "（EFI System / Linux root / Linux data），每个分区首扇区有标识文本。"
+            "逐块 PUT 到 /api/clones/{name}/blocks/{no} 即可装入。"
+        ),
+        "blocks": [b.hex() for b in blocks],
+    }
 
 
 @app.get("/api/retirement")

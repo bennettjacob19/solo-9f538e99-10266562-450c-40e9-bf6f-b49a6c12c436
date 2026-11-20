@@ -13,6 +13,8 @@ services:
       RETIRE_BATCH_SIZE: "8"
       # 故障演练用：设为 before_index_remove 或 before_gc_delete 可模拟退役失败
       # FAILPOINT: "before_gc_delete"
+      # 模拟慢盘（秒）：观察一盘的 GPT 检查/分区读取不阻塞另一盘的单块读取
+      # DISK_DELAY: "0.2"
     volumes:
       - blockstore-data:/data
     restart: unless-stopped

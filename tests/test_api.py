@@ -101,3 +101,74 @@ def test_index_page_served(client):
     r = c.get("/")
     assert r.status_code == 200
     assert "text/html" in r.headers["content-type"]
+
+
+# --------------------------------------------------------------------- GPT
+def _load_sample_via_api(c, name):
+    """经原块写接口把 GPT 样盘装入指定克隆盘。"""
+    sample = c.get("/api/sample-gpt").json()
+    for i, hexdata in enumerate(sample["blocks"]):
+        r = c.put(f"/api/clones/{name}/blocks/{i}", json={"data_hex": hexdata})
+        assert r.status_code == 200
+    return sample
+
+
+def test_gpt_check_on_fresh_volume_is_invalid(client):
+    c, _ = client
+    r = c.get("/api/clones/clone-a/gpt")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "invalid"
+    assert body["used_table"] is None
+    assert body["partitions"] == []
+    assert body["primary"]["errors"] and body["backup"]["errors"]
+    # 读取被拒绝：无可用表 -> 409 提示重新检查
+    resp = c.get("/api/clones/clone-a/gpt/partitions/1/sectors/0?digest=abc")
+    assert resp.status_code == 409
+    assert resp.json()["recheck"] is True
+
+
+def test_gpt_sample_load_check_and_sector_read(client):
+    c, _ = client
+    sample = _load_sample_via_api(c, "clone-b")
+
+    check = c.get("/api/clones/clone-b/gpt").json()
+    assert check["status"] == "ok"
+    assert check["used_table"] == "primary"
+    assert [p["no"] for p in check["partitions"]] == [1, 2, 3]
+    digest = check["table_digest"]
+    first = check["partitions"][0]
+
+    # 分区内第 0 扇区 == 样盘映像对应 LBA 的 512 字节
+    img = bytes.fromhex("".join(sample["blocks"]))
+    r = c.get(f"/api/clones/clone-b/gpt/partitions/1/sectors/0?digest={digest}")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["lba"] == first["first_lba"]
+    assert body["length"] == 512
+    assert body["data_hex"] == img[first["first_lba"] * 512:(first["first_lba"] + 1) * 512].hex()
+
+    # 越界拒绝
+    r = c.get(f"/api/clones/clone-b/gpt/partitions/1/sectors/{first['sectors']}?digest={digest}")
+    assert r.status_code == 400
+    assert "越界" in r.json()["error"]
+
+    # 指纹不符拒绝（409）
+    r = c.get("/api/clones/clone-b/gpt/partitions/1/sectors/0?digest=deadbeef")
+    assert r.status_code == 409
+    assert "重新检查" in r.json()["error"]
+
+    # 交错覆盖 GPT 块后，旧指纹读取被拒；重新检查后恢复
+    c.put("/api/clones/clone-b/blocks/0", json={"pattern": "zero"})
+    r = c.get(f"/api/clones/clone-b/gpt/partitions/1/sectors/0?digest={digest}")
+    assert r.status_code == 409
+    check2 = c.get("/api/clones/clone-b/gpt").json()
+    assert check2["status"] == "degraded"  # 主表失效，采用备份表
+    assert check2["used_table"] == "backup"
+    r = c.get(f"/api/clones/clone-b/gpt/partitions/1/sectors/0?digest={check2['table_digest']}")
+    assert r.status_code == 200
+
+
+def test_gpt_endpoints_validate_clone_name(client):
+    c, _ = client
+    assert c.get("/api/clones/ghost/gpt").status_code == 400

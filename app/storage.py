@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+from . import gpt
+
 BLOCK_SIZE = 4096
 ZEROS = b"\x00" * BLOCK_SIZE
 ZERO_HASH = hashlib.sha256(ZEROS).hexdigest()
@@ -88,6 +90,10 @@ class StorageError(Exception):
     pass
 
 
+class TableChangedError(StorageError):
+    """页面所见的分区表与当前盘状态不符（API 层映射为 409，提示重新检查）。"""
+
+
 class Clone:
     """A COW clone. Metadata layout (version 1)::
 
@@ -147,6 +153,13 @@ class BlockService:
         # (and slow-motion drills) set this to make the background phases
         # observable and failure injection deterministic.
         self.step_delay = float(os.environ.get("RETIRE_STEP_DELAY", "0"))
+        # Simulated disk latency per physical block read (seconds). Used to
+        # demonstrate that a slow GPT check / partition read on one clone does
+        # not block single-block reads on the other clone (per-clone locks).
+        self.disk_delay = float(os.environ.get("DISK_DELAY", "0"))
+        # Optional test hook invoked as hook(clone_name, block_no) before each
+        # physical block read.
+        self.block_read_hook = None
 
         self.template_index: Optional[dict[int, str]] = None
         self.clones: dict[str, Clone] = {}
@@ -237,21 +250,95 @@ class BlockService:
         clone = self._get_clone(clone_name)
         clone.validate_block_no(block_no)
         with clone.lock:
-            entry = clone.blocks.get(block_no)
-            if entry is not None:
-                if entry["kind"] == "zero":
-                    return BlockRead(ZEROS, "zero_discard", ZERO_HASH,
-                                     f"clone:{block_no}")
-                h = entry["hash"]
-                data = self._store_path(h).read_bytes()
-                return BlockRead(data, "clone", h, f"clone:{block_no}")
+            return self._resolve_block(clone, block_no)
 
-            # Unmapped: fall back to the template index while it still exists.
-            if self.template_index is not None and block_no in self.template_index:
-                h = self.template_index[block_no]
-                data = self._store_path(h).read_bytes()
-                return BlockRead(data, "template", h, f"template:{block_no}")
-            return BlockRead(ZEROS, "zero_unmapped", ZERO_HASH, None)
+    def _resolve_block(self, clone: "Clone", block_no: int) -> BlockRead:
+        """Resolve one block's content. Caller must hold ``clone.lock``."""
+        if self.block_read_hook is not None:
+            self.block_read_hook(clone.name, block_no)
+        if self.disk_delay:
+            time.sleep(self.disk_delay)  # simulated disk latency
+        entry = clone.blocks.get(block_no)
+        if entry is not None:
+            if entry["kind"] == "zero":
+                return BlockRead(ZEROS, "zero_discard", ZERO_HASH,
+                                 f"clone:{block_no}")
+            h = entry["hash"]
+            data = self._store_path(h).read_bytes()
+            return BlockRead(data, "clone", h, f"clone:{block_no}")
+
+        # Unmapped: fall back to the template index while it still exists.
+        if self.template_index is not None and block_no in self.template_index:
+            h = self.template_index[block_no]
+            data = self._store_path(h).read_bytes()
+            return BlockRead(data, "template", h, f"template:{block_no}")
+        return BlockRead(ZEROS, "zero_unmapped", ZERO_HASH, None)
+
+    # ------------------------------------------------------------------ GPT
+    def gpt_check(self, clone_name: str) -> dict[str, Any]:
+        """检查一张克隆盘的 GPT。
+
+        整把 clone 锁内完成主备表的全部读取：主、备表来自同一盘状态，
+        期间该盘的覆盖/丢弃被序列化在检查之前或之后；另一张盘不受影响。
+        只读取表所在的块（见返回的 ``blocks_read``）。
+        """
+        clone = self._get_clone(clone_name)
+        with clone.lock:
+            reader = _CloneSectorReader(self, clone)
+            report = gpt.inspect_gpt(reader.read_sectors,
+                                     clone.block_count * gpt.SECTORS_PER_BLOCK)
+            out = report.to_dict()
+            out["disk"] = clone_name
+            out["blocks_read"] = sorted(reader.blocks_read)
+            return out
+
+    def gpt_read_partition_sector(self, clone_name: str, partition_no: int,
+                                  sector: int, digest: str) -> dict[str, Any]:
+        """读取指定分区内（从 0 起算）的一个 512 字节扇区。
+
+        在同一把 clone 锁内先复核分区表（与页面指纹比对），再读目标扇区：
+        复核与读取来自同一盘状态。分区表已变化时抛 ``TableChangedError``。
+        """
+        clone = self._get_clone(clone_name)
+        if not digest:
+            raise StorageError("缺少 table_digest：请先在页面执行 GPT 检查")
+        with clone.lock:
+            reader = _CloneSectorReader(self, clone)
+            report = gpt.inspect_gpt(reader.read_sectors,
+                                     clone.block_count * gpt.SECTORS_PER_BLOCK)
+            if report.table_digest is None:
+                raise TableChangedError(
+                    f"当前磁盘无可用分区表（{report.message}），请重新检查 GPT")
+            if report.table_digest != digest:
+                raise TableChangedError(
+                    "分区表与页面所见不符（磁盘内容已变化），请重新检查 GPT")
+
+            part = next((p for p in report.partitions if p["no"] == partition_no), None)
+            if part is None:
+                nums = [p["no"] for p in report.partitions]
+                raise StorageError(
+                    f"分区 {partition_no} 不存在（当前表的分区编号：{nums or '无'}）")
+            size = part["sectors"]
+            if sector < 0 or sector >= size:
+                raise StorageError(
+                    f"扇区越界：分区 {partition_no} 共有 {size} 个扇区"
+                    f"（0..{size - 1}），请求了 {sector}")
+
+            lba = part["first_lba"] + sector
+            data = reader.read_sectors(lba, 1)
+            return {
+                "disk": clone_name,
+                "partition": partition_no,
+                "sector": sector,
+                "lba": lba,
+                "partition_sectors": size,
+                "table": report.used_table,
+                "table_digest": report.table_digest,
+                "blocks_read": sorted(reader.blocks_read),
+                "length": gpt.SECTOR_SIZE,
+                "data_hex": data.hex(),
+                "preview_ascii": "".join(chr(b) if 32 <= b < 127 else "." for b in data[:64]),
+            }
 
     # ------------------------------------------------------------------ writes
     def _release_if_orphaned(self, h: str) -> bool:
@@ -585,3 +672,41 @@ class BlockService:
         """
         if os.environ.get("FAILPOINT") == name:
             raise StorageError(f"injected failure at failpoint {name!r}")
+
+
+class _CloneSectorReader:
+    """Sector-level view of one clone, used while holding ``clone.lock``.
+
+    Reads only the 4 KiB blocks that actually contain the requested sectors
+    and records them in ``blocks_read`` (proof that GPT checks/reads touch
+    just the table blocks plus the target sector's block).
+    """
+
+    def __init__(self, service: BlockService, clone: Clone):
+        self.service = service
+        self.clone = clone
+        self.disk_sectors = clone.block_count * gpt.SECTORS_PER_BLOCK
+        self.blocks_read: list[int] = []
+        self._cache: dict[int, bytes] = {}
+
+    def read_sectors(self, lba: int, count: int) -> bytes:
+        if lba < 0 or count < 1 or lba + count > self.disk_sectors:
+            raise StorageError(
+                f"sector range [{lba}, {lba + count - 1}] outside disk "
+                f"(0..{self.disk_sectors - 1})")
+        out = bytearray()
+        first_block = lba // gpt.SECTORS_PER_BLOCK
+        last_block = (lba + count - 1) // gpt.SECTORS_PER_BLOCK
+        for bno in range(first_block, last_block + 1):
+            data = self._block(bno)
+            start = max(lba, bno * gpt.SECTORS_PER_BLOCK)
+            end = min(lba + count, (bno + 1) * gpt.SECTORS_PER_BLOCK)
+            off = start - bno * gpt.SECTORS_PER_BLOCK
+            out += data[off * gpt.SECTOR_SIZE:(off + (end - start)) * gpt.SECTOR_SIZE]
+        return bytes(out)
+
+    def _block(self, bno: int) -> bytes:
+        if bno not in self._cache:
+            self._cache[bno] = self.service._resolve_block(self.clone, bno).data
+            self.blocks_read.append(bno)
+        return self._cache[bno]

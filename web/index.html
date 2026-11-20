@@ -70,7 +70,7 @@
 <body>
 <header>
   <h1>本地块存储演练</h1>
-  <span class="sub">只读模板盘 + 两个写时复制（COW）克隆盘 · 块大小 4 KiB · 内容寻址数据卷</span>
+  <span class="sub">只读模板盘 + 两个写时复制（COW）克隆盘 · 块大小 4 KiB · 内容寻址数据卷 · GPT 引导排查</span>
   <span style="flex:1"></span>
   <span id="ret-badge" class="badge b-idle">退役状态：未知</span>
 </header>
@@ -134,6 +134,57 @@
     <pre id="read-hex" class="out">—</pre>
   </section>
 
+  <!-- GPT 检查 -->
+  <section class="panel span2">
+    <h2>GPT 分区表检查（引导问题排查 · 512 字节扇区 · 每表最多 128 项 × 128 字节）</h2>
+    <div class="row">
+      <div>
+        <label>克隆盘</label>
+        <select id="gpt-disk">
+          <option value="clone-a">clone-a（克隆盘 A）</option>
+          <option value="clone-b">clone-b（克隆盘 B）</option>
+        </select>
+      </div>
+      <div style="flex:0">
+        <button id="btn-gpt-check">检查 GPT</button>
+      </div>
+      <div style="flex:0">
+        <button id="btn-gpt-sample" class="secondary">装入 GPT 样盘（经块写接口）</button>
+      </div>
+      <div style="align-self:center" class="muted">
+        主备表取自同一盘状态，只读取表所在的块；覆盖/丢弃可与检查、读取交错
+      </div>
+    </div>
+    <div id="gpt-flash" class="flash"></div>
+    <div id="gpt-summary" style="display:none">
+      <div id="gpt-banner"></div>
+      <div id="gpt-geo" class="kv" style="margin-top:8px"></div>
+      <div class="row" style="margin-top:10px; align-items:stretch">
+        <div class="panel" style="flex:1; margin:0" id="gpt-card-primary"></div>
+        <div class="panel" style="flex:1; margin:0" id="gpt-card-backup"></div>
+      </div>
+      <div id="gpt-parts-wrap" style="margin-top:10px"></div>
+      <div id="gpt-blocks" style="margin-top:8px"></div>
+    </div>
+    <div id="gpt-read-wrap" style="display:none; margin-top:12px; border-top:1px solid var(--line); padding-top:6px">
+      <div class="row">
+        <div>
+          <label>分区</label>
+          <select id="gpt-part"></select>
+        </div>
+        <div>
+          <label>分区内扇区号（从 0 起算）</label>
+          <input type="number" id="gpt-sector" value="0" min="0" />
+        </div>
+        <div style="flex:0">
+          <button id="btn-gpt-read">读取 512 字节</button>
+        </div>
+      </div>
+      <div id="gpt-read-meta" class="kv" style="margin-top:8px"></div>
+      <pre id="gpt-read-hex" class="out" style="margin-top:8px">—</pre>
+    </div>
+  </section>
+
   <!-- 退役控制 -->
   <section class="panel span2">
     <h2>模板盘退役（后台执行，可中断续跑）</h2>
@@ -177,7 +228,12 @@ function esc(s) {
 async function api(path, opts) {
   const r = await fetch(path, opts);
   const body = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(body.error || ("HTTP " + r.status));
+  if (!r.ok) {
+    const err = new Error(body.error || ("HTTP " + r.status));
+    err.status = r.status;
+    err.body = body;
+    throw err;
+  }
   return body;
 }
 
@@ -311,6 +367,7 @@ async function doWrite() {
     const r = await api(`/api/clones/${name}/blocks/${no}`, {
       method: "PUT", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
     flash($("op-flash"), `覆盖成功：${name} 块 ${r.block_no} → ${r.hash.slice(0,16)}…`, true);
+    markGptStale(name);
     await refresh(); doRead();
   } catch (e) { flash($("op-flash"), "覆盖失败：" + e.message, false); }
 }
@@ -321,14 +378,176 @@ async function doDiscard() {
   try {
     await api(`/api/clones/${name}/blocks/${no}`, {method: "DELETE"});
     flash($("op-flash"), `已丢弃：${name} 块 ${no} 现在读零`, true);
+    markGptStale(name);
     await refresh(); doRead();
   } catch (e) { flash($("op-flash"), "丢弃失败：" + e.message, false); }
 }
 
+// ---------------------------------------------------------------- GPT 检查
+let gptState = null;  // {disk, digest, partitions} —— 页面当前所见的分区表
+
+function okIcon(v) {
+  return v === true ? '<span class="ok">✔ 通过</span>'
+    : v === false ? '<span class="err">✖ 失败</span>' : '<span class="muted">—</span>';
+}
+
+function tableCard(t, used) {
+  const badge = t.valid ? '<span class="ok">有效</span>' : '<span class="err">失效</span>';
+  const usedTag = used ? ' <span class="tag clone">采用此表</span>' : "";
+  let rows = [["头位置", `LBA ${t.header_lba}`]];
+  if (t.header) {
+    rows.push(["头部 CRC", okIcon(t.header.header_crc_ok)]);
+    rows.push(["表项数组 CRC", okIcon(t.header.array_crc_ok)]);
+    rows.push(["表项数组", `LBA ${t.header.entries_lba} · ${t.header.num_entries} 项 × ${t.header.entry_size} B`]);
+    rows.push(["可用范围", `${t.header.first_usable_lba} .. ${t.header.last_usable_lba}`]);
+    rows.push(["磁盘 GUID", `<span class="mono">${esc(t.header.disk_guid)}</span>`]);
+  }
+  const errs = t.errors.map(e => `<div class="err" style="margin-top:4px">✖ ${esc(e)}</div>`).join("");
+  const warns = t.warnings.map(w => `<div class="warn" style="margin-top:4px">⚠ ${esc(w)}</div>`).join("");
+  return `<div style="font-weight:600;margin-bottom:8px">${esc(t.label)} ${badge}${usedTag}</div>
+    <div class="kv">${rows.map(([k, v]) => `<div class="k">${k}</div><div>${v}</div>`).join("")}</div>
+    ${errs}${warns}`;
+}
+
+function renderGpt(r) {
+  $("gpt-summary").style.display = "";
+  const cls = {ok: "ok", degraded: "warn", invalid: "err", inconsistent: "err"}[r.status] || "muted";
+  const icon = {ok: "✔", degraded: "⚠", invalid: "✖", inconsistent: "✖"}[r.status] || "";
+  $("gpt-banner").innerHTML =
+    `<div class="${cls}" style="font-weight:600">${icon} ${esc(r.message)}</div>`;
+  $("gpt-geo").innerHTML = [
+    ["盘几何", `${r.disk_sectors} 个扇区 × ${r.sector_size} B（${r.disk_sectors / 8} 块 × 4 KiB）`],
+    ["保护性 MBR", r.pmbr.ok ? '<span class="ok">正常</span>'
+      : `<span class="warn">${esc(r.pmbr.problems.join("；"))}</span>`],
+    ["布局一致性", r.layout_consistent ? '<span class="ok">主备一致</span>'
+      : `<span class="err">${esc(r.consistency_problems.join("；"))}</span>`],
+  ].map(([k, v]) => `<div class="k">${k}</div><div>${v}</div>`).join("");
+  $("gpt-card-primary").innerHTML = tableCard(r.primary, r.used_table === "primary");
+  $("gpt-card-backup").innerHTML = tableCard(r.backup, r.used_table === "backup");
+
+  if (r.partitions.length) {
+    const rows = r.partitions.map(p =>
+      `<tr><td>${p.no}</td><td>${p.first_lba}</td><td>${p.last_lba}</td><td>${p.sectors}</td>` +
+      `<td>${esc(p.name || "")}</td><td class="mono" style="font-size:11px">${p.type_guid}</td></tr>`);
+    $("gpt-parts-wrap").innerHTML =
+      `<table><thead><tr><th>编号</th><th>起始 LBA</th><th>结束 LBA</th><th>扇区数</th>` +
+      `<th>名称</th><th>类型 GUID</th></tr></thead><tbody>${rows.join("")}</tbody></table>`;
+  } else {
+    $("gpt-parts-wrap").innerHTML = `<div class="muted">无可用分区列表（分区读取已停用）</div>`;
+  }
+  $("gpt-blocks").innerHTML = `<span class="muted">本次检查读取的块（仅表所在的块）：</span>` +
+    r.blocks_read.map(b => `<span class="chip">${b}</span>`).join("");
+
+  // 记录页面所见的表指纹，填充分区下拉；无可用表时停用分区读取
+  gptState = r.table_digest ? {disk: r.disk, digest: r.table_digest, partitions: r.partitions} : null;
+  const sel = $("gpt-part");
+  sel.innerHTML = "";
+  if (gptState && gptState.partitions.length) {
+    for (const p of gptState.partitions) {
+      const opt = document.createElement("option");
+      opt.value = p.no;
+      opt.textContent = `分区 ${p.no}：${p.name || "(未命名)"} · LBA ${p.first_lba}..${p.last_lba}（${p.sectors} 扇区）`;
+      sel.appendChild(opt);
+    }
+    $("gpt-read-wrap").style.display = "";
+  } else {
+    $("gpt-read-wrap").style.display = "none";
+  }
+  $("gpt-sector").value = 0;
+  $("gpt-read-meta").innerHTML = "";
+  $("gpt-read-hex").textContent = "—";
+}
+
+async function doGptCheck() {
+  const disk = $("gpt-disk").value;
+  $("gpt-flash").innerHTML = "";
+  try {
+    const r = await api(`/api/clones/${disk}/gpt`);
+    renderGpt(r);
+  } catch (e) { flash($("gpt-flash"), "GPT 检查失败：" + e.message, false); }
+}
+
+function hexdump(hex) {
+  const bs = hex.match(/../g) || [];
+  const lines = [];
+  for (let off = 0; off < bs.length; off += 16) {
+    const chunk = bs.slice(off, off + 16);
+    const asc = chunk.map(b => {
+      const c = parseInt(b, 16);
+      return c >= 32 && c < 127 ? String.fromCharCode(c) : ".";
+    }).join("");
+    lines.push(off.toString(16).padStart(4, "0") + "  " + chunk.join(" ").padEnd(47) + "  " + asc);
+  }
+  return lines.join("\n");
+}
+
+async function doGptRead() {
+  const disk = $("gpt-disk").value;
+  if (!gptState || gptState.disk !== disk) {
+    return flash($("gpt-flash"), "请先对当前选择的盘执行「检查 GPT」", false);
+  }
+  const p = parseInt($("gpt-part").value, 10);
+  const s = parseInt($("gpt-sector").value, 10);
+  if (Number.isNaN(s) || s < 0) return flash($("gpt-flash"), "扇区号无效（须 ≥ 0）", false);
+  try {
+    const r = await api(`/api/clones/${disk}/gpt/partitions/${p}/sectors/${s}?digest=${gptState.digest}`);
+    $("gpt-read-meta").innerHTML = [
+      ["分区 / 扇区", `分区 ${r.partition} 的第 ${r.sector} 扇区（共 ${r.partition_sectors} 个）→ 盘 LBA ${r.lba}`],
+      ["采用的表", r.table === "primary" ? "主表" : "备份表"],
+      ["读取的块", r.blocks_read.join(", ")],
+    ].map(([k, v]) => `<div class="k">${k}</div><div class="mono">${v}</div>`).join("");
+    $("gpt-read-hex").textContent = hexdump(r.data_hex);
+    flash($("gpt-flash"), `已读取分区 ${p} 的第 ${s} 扇区（512 字节）`, true);
+  } catch (e) {
+    $("gpt-read-hex").textContent = "—";
+    if (e.status === 409 || (e.body && e.body.recheck)) {
+      flash($("gpt-flash"), "已拒绝读取：" + e.message + " —— 请点击「检查 GPT」", false);
+    } else {
+      flash($("gpt-flash"), "读取被拒绝：" + e.message, false);
+    }
+  }
+}
+
+async function doLoadSample() {
+  const disk = $("gpt-disk").value;
+  if (!confirm(`将经由原块写接口（PUT /api/clones/${disk}/blocks/*）把 GPT 样盘写入 ${disk} 的全部块，现有内容会被覆盖。继续？`)) return;
+  try {
+    const sample = await api("/api/sample-gpt");
+    for (let i = 0; i < sample.blocks.length; i++) {
+      $("gpt-flash").innerHTML = `<span class="muted">正在经块写接口写入块 ${i + 1}/${sample.blocks.length}…</span>`;
+      await api(`/api/clones/${disk}/blocks/${i}`, {
+        method: "PUT", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({data_hex: sample.blocks[i]}),
+      });
+    }
+    flash($("gpt-flash"), `样盘已装入 ${disk}（${sample.blocks.length} 块），正在检查 GPT…`, true);
+    await refresh();
+    await doGptCheck();
+  } catch (e) { flash($("gpt-flash"), "装入样盘失败：" + e.message, false); }
+}
+
+function markGptStale(disk) {
+  // 块覆盖/丢弃可与 GPT 检查、读取交错；若动的是 GPT 面板所选盘，提示重新检查
+  if (gptState && gptState.disk === disk) {
+    $("gpt-flash").innerHTML =
+      `<span class="warn">注意：${esc(disk)} 刚发生块改动，分区表可能已变化；` +
+      `读取时会自动复核，建议重新「检查 GPT」。</span>`;
+  }
+}
+
+$("btn-gpt-check").onclick = doGptCheck;
+$("btn-gpt-read").onclick = doGptRead;
+$("btn-gpt-sample").onclick = doLoadSample;
+$("gpt-disk").onchange = () => {
+  gptState = null;
+  $("gpt-summary").style.display = "none";
+  $("gpt-read-wrap").style.display = "none";
+  $("gpt-flash").innerHTML = "";
+};
+
 $("btn-read").onclick = doRead;
 $("btn-write").onclick = doWrite;
-$("btn-discard").onclick = doDiscard;
-$("btn-refresh").onclick = refresh;
+$("btn-discard").onclick = doDiscard;$("btn-refresh").onclick = refresh;
 $("btn-retire").onclick = async () => {
   try {
     const r = await api("/api/retirement/start", {method: "POST"});
